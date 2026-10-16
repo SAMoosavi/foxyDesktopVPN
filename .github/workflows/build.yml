@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -25,6 +26,14 @@ jobs:
       - name: Install Trunk
         run: cargo install trunk --locked
       - uses: tauri-apps/tauri-action@v0
+        # Task 10: signing for the updater. The minisign private key lives ONLY
+        # in Actions secrets (TAURI_SIGNING_PRIVATE_KEY [+ _PASSWORD]); generate
+        # it locally with `cargo tauri signer generate -w ~/.tauri/foxy.key` and
+        # never commit it. Absent secrets (PRs/forks) → unsigned bundles, build
+        # still green; on tags with secrets set → .sig sidecars are emitted.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           args: --bundles appimage,deb
       - name: Upload Linux bundles
@@ -34,6 +43,7 @@ jobs:
           if-no-files-found: error
           path: |
             src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.sig
             src-tauri/target/release/bundle/deb/*.deb
 
   build-windows:
@@ -46,6 +56,10 @@ jobs:
       - name: Install Trunk
         run: cargo install trunk --locked
       - uses: tauri-apps/tauri-action@v0
+        # Task 10: same signing setup as Linux (private key = Actions secrets only).
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           args: --bundles nsis
       - name: Upload Windows bundle
@@ -53,7 +67,9 @@ jobs:
         with:
           name: windows-bundle
           if-no-files-found: error
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.sig
 
   build-android:
     runs-on: ubuntu-22.04
@@ -91,3 +107,51 @@ jobs:
           name: android-bundle
           if-no-files-found: error
           path: src-tauri/gen/android/**/build/outputs/apk/**/*.apk
+
+  # Task 10: updater release path (AC14). Tag a version (`git tag v0.2.0 &&
+  # git push --tags`) → desktop jobs above sign their bundles → this job
+  # publishes installers + .sig sidecars + a generated latest.json to the
+  # GitHub Release, which is what tauri.conf.json `plugins.updater.endpoints`
+  # polls. Uses only the preinstalled `gh` CLI (no new actions). Manual step:
+  # install vN, publish vN+1, confirm the update prompt (no reinstall).
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-bundles
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-bundle
+      - name: Assemble latest.json + publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          url_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          platforms=""
+          for sig in *.sig; do
+            [ -e "$sig" ] || continue
+            asset="${sig%.sig}"
+            case "$asset" in
+              *.AppImage) platform="linux-x86_64" ;;
+              *.exe) platform="windows-x86_64" ;;
+              *) continue ;;
+            esac
+            platforms="${platforms:+$platforms,}\"$platform\":{\"signature\":\"$(cat "$sig")\",\"url\":\"$url_base/$asset\"}"
+          done
+          if [ -z "$platforms" ]; then
+            echo "release: no signed (.sig) updater artifacts — set TAURI_SIGNING_PRIVATE_KEY secret, then re-tag." >&2
+            exit 1
+          fi
+          printf '{"version":"%s","notes":"Release %s","pub-date":"%s","platforms":{%s}}' \
+            "$version" "$tag" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$platforms" > latest.json
+          cat latest.json
+          gh release create "$tag" --title "$tag" --notes "Release $tag" ./* 2>/dev/null \
+            || gh release upload "$tag" ./* --clobber

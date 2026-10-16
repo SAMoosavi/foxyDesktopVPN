@@ -1095,6 +1095,7 @@ fn list_servers(app: AppHandle, auth: State<AuthState>) -> ServerList {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AuthState::default())
         .manage(VpnStore::default())
         .invoke_handler(tauri::generate_handler![

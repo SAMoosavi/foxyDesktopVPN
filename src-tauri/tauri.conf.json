@@ -25,6 +25,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -32,5 +33,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/<org>/<repo>/releases/latest/download/latest.json"
+      ],
+      "pubkey": "TODO(task10): run `cargo tauri signer generate -w ~/.tauri/foxy.key`, paste the public key here, and replace <org>/<repo> above after `gh repo create` (task 11 runbook)"
+    }
   }
 }
