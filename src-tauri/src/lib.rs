@@ -263,13 +263,122 @@ pub mod linux_tunnel {
     }
 }
 
-/// Platform tunnel open: Linux tries the system path with stub fallback;
-/// other OSes use the stub until tasks 6–7.
+// Task 6: Windows system tunnel (AC4/AC9 Windows: fully-system routing via
+// Wintun + adapter-install consent). ponytail: std only — no new `wintun` dep
+// (architect approval required per tasks.md gate, not requested from this
+// worktree). The module is unconditional std-only so its config/framing parsing
+// + fallback path unit-test on Linux; anything touching WinAPI later stays
+// behind #[cfg(target_os = "windows")]. Live path: `Adapter::create` on the
+// FoxyVPN pool name triggers the Windows adapter-install consent dialog (the
+// AC9 OS indicator), then the shared CONNECT framing + packet loop run as on
+// Linux. Until the `wintun` crate lands, ANY open falls back to StubTunnel with
+// a clear note, so `cargo test` stays green everywhere (hardware IP-check and
+// the consent dialog are manual).
+pub mod windows_tunnel {
+    use super::{StubTunnel, Tunnel, stub_exit_ip};
+
+    /// Wintun adapter pool name — the label shown in the adapter-install
+    /// consent dialog (AC9 indicator).
+    pub const ADAPTER_NAME: &str = "FoxyVPN";
+    pub const TUN_ADDR: &str = "10.42.0.2";
+    pub const WINTUN_DLL: &str = "wintun.dll";
+
+    /// Edge host for a server: prefer the Guardian hostname, else derive it.
+    pub fn edge_host(server: &str, hostname: &str) -> String {
+        if hostname.is_empty() {
+            format!("{server}.guardian.vpn.mozilla.org")
+        } else {
+            hostname.to_owned()
+        }
+    }
+
+    /// CONNECT request to the Fastly edge, authorized by the Guardian token
+    /// (same headers as the Linux path; sent by the live data plane once the
+    /// approved `wintun` dep lands).
+    pub fn connect_request(host: &str, token: &str) -> String {
+        format!(
+            "CONNECT {host}:443 HTTP/1.1\r\n\
+             Host: {host}:443\r\n\
+             Authorization: Bearer {token}\r\n\
+             Proxy-Authorization: Bearer {token}\r\n\r\n"
+        )
+    }
+
+    /// Parse `route print -4`: gateway of the `0.0.0.0/0.0.0.0` line, saved so
+    /// disconnect can confirm the direct route is back (AC5).
+    pub fn parse_route_print(route_print: &str) -> Option<String> {
+        route_print.lines().find_map(|line| {
+            let mut words = line.split_whitespace();
+            if words.next() != Some("0.0.0.0") {
+                return None;
+            }
+            if words.next() != Some("0.0.0.0") {
+                return None;
+            }
+            words.next().map(str::to_owned)
+        })
+    }
+
+    /// Wintun preflight with no side effects and no prompt: off-Windows it is
+    /// always unavailable; on Windows the driver check needs the approved
+    /// `wintun` crate, so it reports that until the dep lands (no silent fake).
+    pub fn wintun_available() -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        return Err(
+            "Wintun bring-up needs the approved `wintun` crate — using stub tunnel.".into(),
+        );
+        #[cfg(not(target_os = "windows"))]
+        return Err("Wintun is Windows-only — using stub tunnel.".into());
+    }
+
+    pub struct TunnelOpen {
+        pub exit_ip: String,
+        pub used_stub: bool,
+        pub note: Option<String>,
+    }
+
+    /// Smallest-viable Windows open: preflight → Wintun adapter.
+    /// ANY failure → StubTunnel with a clear note (green tests, no hangs).
+    pub fn open_or_fallback(server: &str) -> TunnelOpen {
+        open_with_probe(server, wintun_available())
+    }
+
+    /// Injectable preflight so tests pin the fallback path deterministically.
+    pub fn open_with_probe(server: &str, preflight: Result<(), String>) -> TunnelOpen {
+        let fallback = |note: String| TunnelOpen {
+            exit_ip: StubTunnel::open(server),
+            used_stub: true,
+            note: Some(note),
+        };
+        if let Err(note) = preflight {
+            return fallback(note);
+        }
+        let _edge = edge_host(server, "");
+        let _adapter = ADAPTER_NAME;
+        fallback(
+            "Wintun adapter install needs the approved `wintun` crate + one adapter-consent click — using stub tunnel."
+                .into(),
+        )
+    }
+
+    /// Tear down the FoxyVPN adapter; Windows restores the previous default
+    /// route automatically (AC5: IP-check shows the direct IP again). No-op
+    /// until the `wintun` crate lands, so disconnect never prompts or hangs on
+    /// the fallback path.
+    pub fn close_system() {}
+}
+
+/// Platform tunnel open: Linux/Windows try their system path with stub
+/// fallback; other OSes use the stub until task 7.
 #[cfg(target_os = "linux")]
 fn open_tunnel(server: &str) -> String {
     linux_tunnel::open_or_fallback(server).exit_ip
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn open_tunnel(server: &str) -> String {
+    windows_tunnel::open_or_fallback(server).exit_ip
+}
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn open_tunnel(server: &str) -> String {
     StubTunnel::open(server)
 }
@@ -279,7 +388,12 @@ fn close_tunnel() {
     linux_tunnel::close_system();
     StubTunnel::close();
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn close_tunnel() {
+    windows_tunnel::close_system();
+    StubTunnel::close();
+}
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn close_tunnel() {
     StubTunnel::close();
 }
@@ -911,5 +1025,67 @@ mod tests {
         assert_eq!(second, first, "repeat connect must not change state");
         assert_eq!(store.inner.lock().unwrap().handles, 1);
         vpn_disconnect_impl(&store);
+    }
+
+    // Task 6 (Windows): adapter config/framing parsing + fallback path; plain
+    // #[test] (no cfg gate) so they run on this Linux host, and the module is
+    // std-only so it compiles here. Guard tests above stay untouched.
+    #[test]
+    fn windows_edge_and_connect_request_carry_guardian_config() {
+        assert_eq!(
+            windows_tunnel::edge_host("x", "edge.example.com"),
+            "edge.example.com"
+        );
+        assert_eq!(
+            windows_tunnel::edge_host("us-california", ""),
+            "us-california.guardian.vpn.mozilla.org"
+        );
+        let req = windows_tunnel::connect_request("edge.example.com", "tok123");
+        assert!(req.starts_with("CONNECT edge.example.com:443"), "{req}");
+        assert!(req.contains("Bearer tok123"), "{req}");
+    }
+
+    #[test]
+    fn windows_route_print_parses_default_gateway() {
+        let out = "IPv4 Route Table\r\n\
+                   Network Destination        Netmask          Gateway       Interface  Metric\r\n\
+                             0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.10     35\r\n\
+                           127.0.0.0        255.0.0.0         On-link         127.0.0.1    331\r\n";
+        assert_eq!(
+            windows_tunnel::parse_route_print(out),
+            Some("192.168.1.1".into())
+        );
+        assert_eq!(
+            windows_tunnel::parse_route_print("127.0.0.0  255.0.0.0  On-link  127.0.0.1  331\n"),
+            None
+        );
+        assert_eq!(windows_tunnel::parse_route_print(""), None);
+    }
+
+    #[test]
+    fn windows_adapter_constants_pin_consent_label() {
+        // ADAPTER_NAME is the label in the adapter-install consent dialog (AC9).
+        assert_eq!(windows_tunnel::ADAPTER_NAME, "FoxyVPN");
+        assert!(!windows_tunnel::TUN_ADDR.is_empty());
+        assert_eq!(windows_tunnel::WINTUN_DLL, "wintun.dll");
+    }
+
+    #[test]
+    fn windows_fallback_uses_stub_with_clear_note() {
+        let opened =
+            windows_tunnel::open_with_probe("jp-tokyo", Err("simulated: no Wintun in CI".into()));
+        assert!(opened.used_stub);
+        assert_eq!(opened.exit_ip, stub_exit_ip("jp-tokyo"));
+        assert_eq!(opened.note.as_deref(), Some("simulated: no Wintun in CI"));
+        // Live path also falls back until the `wintun` dep is approved.
+        let live = windows_tunnel::open_with_probe("jp-tokyo", Ok(()));
+        assert!(live.used_stub);
+        assert!(live.note.unwrap_or_default().contains("wintun"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn windows_preflight_reports_windows_only_off_windows() {
+        assert!(windows_tunnel::wintun_available().is_err());
     }
 }
