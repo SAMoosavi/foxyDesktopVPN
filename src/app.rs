@@ -1,67 +1,94 @@
+use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos::{ev::SubmitEvent, prelude::*};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"])]
     async fn invoke(cmd: &str, args: JsValue) -> JsValue;
+
+    // Sync binding returning the raw Promise: avoids borrowing a Closure across an await.
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = "listen")]
+    fn listen_raw(event: &str, handler: &JsValue) -> js_sys::Promise;
 }
 
-#[derive(Serialize, Deserialize)]
-struct GreetArgs<'a> {
-    name: &'a str,
+#[derive(Serialize, Deserialize, Clone)]
+struct AuthChanged {
+    signed_in: bool,
+}
+
+#[derive(Deserialize)]
+struct TauriEvent {
+    payload: AuthChanged,
 }
 
 #[component]
 pub fn App() -> impl IntoView {
-    let (name, set_name) = signal(String::new());
-    let (greet_msg, set_greet_msg) = signal(String::new());
+    let (signed_in, set_signed_in) = signal(false);
+    let (status, set_status) = signal(String::from("Signed out."));
 
-    let update_name = move |ev| {
-        let v = event_target_value(&ev);
-        set_name.set(v);
-    };
-
-    let greet = move |ev: SubmitEvent| {
-        ev.prevent_default();
-        spawn_local(async move {
-            let name = name.get_untracked();
-            if name.is_empty() {
-                return;
+    // Backend `auth-changed` events drive the signed-in home (sign-in callback or sign-out).
+    Effect::new(move || {
+        let handler: Closure<dyn Fn(JsValue)> = Closure::new(move |event: JsValue| {
+            if let Ok(ev) = serde_wasm_bindgen::from_value::<TauriEvent>(event) {
+                set_signed_in.set(ev.payload.signed_in);
+                set_status.set(if ev.payload.signed_in {
+                    String::from("Signed in — welcome home.")
+                } else {
+                    String::from("Signed out.")
+                });
             }
+        });
+        spawn_local(async move {
+            let _ = JsFuture::from(listen_raw("auth-changed", handler.as_ref())).await;
+            // ponytail: single app-lifetime listener, never unlistened.
+            handler.forget();
+        });
+    });
 
-            let args = serde_wasm_bindgen::to_value(&GreetArgs { name: &name }).unwrap();
-            // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-            let new_msg = invoke("greet", args).await.as_string().unwrap();
-            set_greet_msg.set(new_msg);
+    let sign_in = move |_| {
+        // Immediate feedback (AC12); the signed-in home arrives via `auth-changed`.
+        set_status.set(String::from("Opening system browser…"));
+        spawn_local(async move {
+            let msg = invoke("auth_sign_in", JsValue::UNDEFINED)
+                .await
+                .as_string()
+                .unwrap_or_default();
+            if !msg.is_empty() {
+                set_status.set(msg);
+            }
+        });
+    };
+    let sign_out = move |_| {
+        spawn_local(async move {
+            invoke("auth_sign_out", JsValue::UNDEFINED).await;
         });
     };
 
     view! {
         <main class="container">
-            <h1>"Welcome to Tauri + Leptos"</h1>
-
-            <div class="row">
-                <a href="https://tauri.app" target="_blank">
-                    <img src="public/tauri.svg" class="logo tauri" alt="Tauri logo"/>
-                </a>
-                <a href="https://docs.rs/leptos/" target="_blank">
-                    <img src="public/leptos.svg" class="logo leptos" alt="Leptos logo"/>
-                </a>
-            </div>
-            <p>"Click on the Tauri and Leptos logos to learn more."</p>
-
-            <form class="row" on:submit=greet>
-                <input
-                    id="greet-input"
-                    placeholder="Enter a name..."
-                    on:input=update_name
-                />
-                <button type="submit">"Greet"</button>
-            </form>
-            <p>{ move || greet_msg.get() }</p>
+            <h1>"FoxyVPN"</h1>
+            {move || {
+                if signed_in.get() {
+                    view! {
+                        <div>
+                            <p>"Signed in ✓"</p>
+                            <button on:click=sign_out>"Sign out"</button>
+                        </div>
+                    }
+                        .into_any()
+                } else {
+                    view! {
+                        <div>
+                            <button on:click=sign_in>"Sign in with Firefox"</button>
+                        </div>
+                    }
+                        .into_any()
+                }
+            }}
+            <p>{move || status.get()}</p>
         </main>
     }
 }
