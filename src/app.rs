@@ -126,6 +126,8 @@ pub fn App() -> impl IntoView {
         });
     };
     let sign_out = move |_| {
+        // Immediate feedback (AC12); the signed-out state arrives via `auth-changed`.
+        set_status.set(String::from("Signing out…"));
         spawn_local(async move {
             invoke("auth_sign_out", JsValue::UNDEFINED).await;
         });
@@ -136,6 +138,7 @@ pub fn App() -> impl IntoView {
     let toggle_vpn = move |_| {
         set_vpn_error.set(None);
         if connected.get_untracked() {
+            set_vpn_line.set(String::from("Disconnecting…"));
             spawn_local(async move {
                 let value = invoke("vpn_disconnect", JsValue::UNDEFINED).await;
                 match serde_wasm_bindgen::from_value::<VpnStatus>(value) {
