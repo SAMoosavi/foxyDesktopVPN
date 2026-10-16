@@ -208,12 +208,147 @@ fn auth_sign_out(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+// Task 3: server list fetch + picker UI (AC2: city/country list; AC12: no spinner, error line).
+// ponytail: one struct + pure resolver (fetch injectable so tests stay offline); the live
+// fetch is a single short-timeout reqwest call, any failure → fixture + error string.
+pub const GUARDIAN_SERVERS_URL: &str = "https://vpn.mozilla.org/api/v1/vpn/servers/";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Server {
+    pub id: String,
+    pub city: String,
+    pub country: String,
+    #[serde(default)]
+    pub hostname: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServerList {
+    pub servers: Vec<Server>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub fn fixture_servers() -> Vec<Server> {
+    vec![
+        Server {
+            id: "us-california".into(),
+            city: "Los Angeles".into(),
+            country: "United States".into(),
+            hostname: "us-california.guardian.vpn.mozilla.org".into(),
+        },
+        Server {
+            id: "de-berlin".into(),
+            city: "Berlin".into(),
+            country: "Germany".into(),
+            hostname: "de-berlin.guardian.vpn.mozilla.org".into(),
+        },
+        Server {
+            id: "jp-tokyo".into(),
+            city: "Tokyo".into(),
+            country: "Japan".into(),
+            hostname: "jp-tokyo.guardian.vpn.mozilla.org".into(),
+        },
+    ]
+}
+
+/// Tolerant parse: accept a bare array or `{servers|results: [...]}`; skip entries
+/// missing city/country (the picker needs both).
+pub fn parse_servers(value: &serde_json::Value) -> Vec<Server> {
+    let items = match value {
+        serde_json::Value::Array(items) => items.as_slice(),
+        serde_json::Value::Object(map) => map
+            .get("servers")
+            .or_else(|| map.get("results"))
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        _ => &[],
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let city = item.get("city")?.as_str()?;
+            let country = item.get("country")?.as_str()?;
+            if city.is_empty() || country.is_empty() {
+                return None;
+            }
+            Some(Server {
+                id: item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(city)
+                    .to_owned(),
+                city: city.to_owned(),
+                country: country.to_owned(),
+                hostname: item
+                    .get("hostname")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn fetch_live_servers(token: &str) -> Result<Vec<Server>, String> {
+    let body: serde_json::Value = reqwest::blocking::Client::new()
+        .get(GUARDIAN_SERVERS_URL)
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    Ok(parse_servers(&body))
+}
+
+pub fn resolve_servers_with(
+    token: Option<String>,
+    fetch: impl FnOnce(&str) -> Result<Vec<Server>, String>,
+) -> ServerList {
+    match token {
+        None => ServerList {
+            servers: vec![],
+            error: Some("Signed out — please sign in again.".into()),
+        },
+        Some(token) => match fetch(&token) {
+            Ok(servers) if !servers.is_empty() => ServerList {
+                servers,
+                error: None,
+            },
+            Ok(_) => ServerList {
+                servers: fixture_servers(),
+                error: Some("Server list is empty — showing sample servers.".into()),
+            },
+            Err(e) => ServerList {
+                servers: fixture_servers(),
+                error: Some(format!(
+                    "Could not reach Guardian ({e}) — showing sample servers."
+                )),
+            },
+        },
+    }
+}
+
+#[tauri::command]
+fn list_servers(auth: State<AuthState>) -> ServerList {
+    let token = auth.token.lock().unwrap().clone();
+    resolve_servers_with(token, fetch_live_servers)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AuthState::default())
-        .invoke_handler(tauri::generate_handler![auth_sign_in, auth_sign_out])
+        .invoke_handler(tauri::generate_handler![
+            auth_sign_in,
+            auth_sign_out,
+            list_servers
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -290,5 +425,46 @@ mod tests {
         );
         assert_eq!(callback_code("/oauth/callback?state=x"), None);
         assert_eq!(callback_code("/favicon.ico?code=abc"), None);
+    }
+
+    #[test]
+    fn servers_carry_city_and_country() {
+        let list = resolve_servers_with(Some("tok".into()), |_| Ok(fixture_servers()));
+        assert!(list.error.is_none());
+        assert!(!list.servers.is_empty());
+        for s in &list.servers {
+            assert!(!s.city.is_empty(), "{s:?}");
+            assert!(!s.country.is_empty(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn unauth_list_is_empty_with_error_not_spinner() {
+        let list = resolve_servers_with(None, |_| Ok(fixture_servers()));
+        assert!(list.servers.is_empty());
+        assert!(list.error.unwrap_or_default().contains("sign in"));
+    }
+
+    #[test]
+    fn fetch_failure_falls_back_to_fixture_with_error() {
+        let list = resolve_servers_with(Some("tok".into()), |_| Err("offline".into()));
+        assert!(!list.servers.is_empty());
+        assert!(list.error.is_some());
+        for s in &list.servers {
+            assert!(!s.city.is_empty());
+            assert!(!s.country.is_empty());
+        }
+    }
+
+    #[test]
+    fn parse_servers_skips_entries_missing_city_country() {
+        let body: serde_json::Value = serde_json::json!([
+            {"id": "a", "city": "Paris", "country": "France", "hostname": "a.example"},
+            {"id": "b", "country": "France"},
+            {"id": "c", "city": "", "country": "France"}
+        ]);
+        let servers = parse_servers(&body);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].city, "Paris");
     }
 }
