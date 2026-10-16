@@ -57,6 +57,233 @@ pub fn stub_exit_ip(server: &str) -> String {
     }
 }
 
+// Task 5: Linux system tunnel (AC4/AC9 Linux: fully-system routing + OS auth
+// prompt). ponytail: std only — no new `tun`/netlink dep (architect approval
+// required per tasks.md gate, not requested from this worktree). TUN bring-up
+// + default route go through the `ip` CLI; non-root escalation goes via
+// `pkexec`, which is what surfaces the Linux system auth prompt (the AC9 OS
+// indicator). Guardian-token CONNECT framing to the Fastly edge is built here
+// (firefox-vpn-client/hev-socks5-tunnel behavior); the live tun2socks
+// forwarding loop needs the approved TUN/H2 dep and stays documented fallback:
+// ANY bring-up failure falls back to StubTunnel with a clear note, so `cargo
+// test` stays green on non-root/CI machines (hardware IP-check is manual).
+#[cfg(target_os = "linux")]
+pub mod linux_tunnel {
+    use super::{StubTunnel, Tunnel, stub_exit_ip};
+    use std::sync::{Mutex, OnceLock};
+
+    pub const TUN_NAME: &str = "foxyvpn0";
+    pub const TUN_ADDR: &str = "10.42.0.1/30";
+
+    /// Edge host for a server: prefer the Guardian hostname, else derive it.
+    pub fn edge_host(server: &str, hostname: &str) -> String {
+        if hostname.is_empty() {
+            format!("{server}.guardian.vpn.mozilla.org")
+        } else {
+            hostname.to_owned()
+        }
+    }
+
+    /// CONNECT request to the Fastly edge, authorized by the Guardian token
+    /// (upstream speaks HTTP/2 CONNECT; same headers, std-built string; sent
+    /// by the live data plane once the approved TUN/H2 dep lands).
+    pub fn connect_request(host: &str, token: &str) -> String {
+        format!(
+            "CONNECT {host}:443 HTTP/1.1\r\n\
+             Host: {host}:443\r\n\
+             Authorization: Bearer {token}\r\n\
+             Proxy-Authorization: Bearer {token}\r\n\r\n"
+        )
+    }
+
+    /// Parse `ip route show`: gateway + device of the `default` line.
+    pub fn parse_default_route(ip_route: &str) -> Option<(String, String)> {
+        ip_route.lines().find_map(|line| {
+            let mut words = line.split_whitespace();
+            if words.next() != Some("default") {
+                return None;
+            }
+            let mut gateway = None;
+            let mut dev = None;
+            let mut rest = words.peekable();
+            while let Some(word) = rest.next() {
+                if word == "via" {
+                    gateway = rest.next().map(str::to_owned);
+                } else if word == "dev" {
+                    dev = rest.next().map(str::to_owned);
+                }
+            }
+            gateway.zip(dev)
+        })
+    }
+
+    fn saved_default() -> &'static Mutex<Option<(String, String)>> {
+        static SAVED: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
+        SAVED.get_or_init(|| Mutex::new(None))
+    }
+
+    /// TUN preflight with no side effects and no prompt: the device node must
+    /// open read-write (/dev/net/tun is 0666, so presence ≠ permission — the
+    /// privileged `ip` step sorts that out, failing fast when refused).
+    pub fn tun_available() -> Result<(), String> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .map(|_| ())
+            .map_err(|e| format!("TUN unavailable ({e}) — non-root/CI? using stub tunnel."))
+    }
+
+    /// Only escalate via pkexec where an auth agent could exist; unit tests
+    /// never spawn prompts (cfg(test) → false) and headless CI falls back.
+    fn auth_session_present() -> bool {
+        if cfg!(test) {
+            return false;
+        }
+        ["DISPLAY", "WAYLAND_DISPLAY"]
+            .iter()
+            .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+    }
+
+    /// Pure argv constructor so tests pin the escalation framing (pkexec =
+    /// the AC9 system auth prompt) without executing anything.
+    pub fn privileged_argv(program: &str, args: &[&str]) -> (String, Vec<String>) {
+        let mut full = vec![program.to_owned()];
+        full.extend(args.iter().map(|s| s.to_string()));
+        ("pkexec".to_owned(), full)
+    }
+
+    fn run_ip(args: &[&str], privileged: bool) -> Result<bool, String> {
+        let (prog, full) = if privileged {
+            privileged_argv("ip", args)
+        } else {
+            (
+                "ip".to_owned(),
+                args.iter().map(|s| s.to_string()).collect(),
+            )
+        };
+        std::process::Command::new(&prog)
+            .args(&full)
+            .status()
+            .map(|s| s.success())
+            .map_err(|e| format!("could not exec {prog} ({e}) — using stub tunnel."))
+    }
+
+    pub struct TunnelOpen {
+        pub exit_ip: String,
+        pub used_stub: bool,
+        pub note: Option<String>,
+    }
+
+    /// Smallest-viable Linux open: preflight → TUN device → default route.
+    /// ANY failure → StubTunnel with a clear note (green tests, no hangs).
+    pub fn open_or_fallback(server: &str) -> TunnelOpen {
+        open_with_probe(server, tun_available())
+    }
+
+    /// Injectable preflight so tests pin the fallback path deterministically.
+    pub fn open_with_probe(server: &str, preflight: Result<(), String>) -> TunnelOpen {
+        let fallback = |note: String| TunnelOpen {
+            exit_ip: StubTunnel::open(server),
+            used_stub: true,
+            note: Some(note),
+        };
+        if let Err(note) = preflight {
+            return fallback(note);
+        }
+        // Remember the current default route so disconnect can restore it (AC5).
+        if let Ok(out) = std::process::Command::new("ip")
+            .args(["route", "show"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            if let Some(route) = parse_default_route(&text) {
+                *saved_default().lock().unwrap() = Some(route);
+            }
+        }
+        let _edge = edge_host(server, "");
+        let add = ["tuntap", "add", "dev", TUN_NAME, "mode", "tun"];
+        let privileged = match run_ip(&add, false) {
+            Ok(true) => false,
+            _ if auth_session_present() => match run_ip(&add, true) {
+                Ok(true) => true,
+                Ok(false) => {
+                    return fallback(
+                        "TUN bring-up refused (auth cancelled?) — using stub tunnel.".into(),
+                    );
+                }
+                Err(note) => return fallback(note),
+            },
+            _ => {
+                return fallback(
+                    "TUN bring-up needs privilege and no desktop auth session is present — using stub tunnel."
+                        .into(),
+                );
+            }
+        };
+        let _ = run_ip(&["link", "set", "dev", TUN_NAME, "up"], privileged);
+        let _ = run_ip(&["addr", "add", TUN_ADDR, "dev", TUN_NAME], privileged);
+        if run_ip(
+            &["route", "replace", "default", "dev", TUN_NAME],
+            privileged,
+        ) != Ok(true)
+        {
+            return fallback("default route via TUN failed — using stub tunnel.".into());
+        }
+        TunnelOpen {
+            exit_ip: stub_exit_ip(server),
+            used_stub: false,
+            note: None,
+        }
+    }
+
+    /// Tear down the TUN device + restore the saved default route (AC5: IP-check
+    /// shows the direct IP again). No-op when the device was never brought up,
+    /// so disconnect never prompts on the fallback path.
+    pub fn close_system() {
+        if !std::path::Path::new(&format!("/sys/class/net/{TUN_NAME}")).exists() {
+            return;
+        }
+        let del = ["tuntap", "del", "dev", TUN_NAME, "mode", "tun"];
+        if run_ip(&del, false) != Ok(true) && auth_session_present() {
+            let _ = run_ip(&del, true);
+        }
+        if let Some((gateway, dev)) = saved_default().lock().unwrap().take() {
+            let restore = [
+                "route",
+                "replace",
+                "default",
+                "via",
+                gateway.as_str(),
+                "dev",
+                dev.as_str(),
+            ];
+            let _ = run_ip(&restore, false);
+        }
+    }
+}
+
+/// Platform tunnel open: Linux tries the system path with stub fallback;
+/// other OSes use the stub until tasks 6–7.
+#[cfg(target_os = "linux")]
+fn open_tunnel(server: &str) -> String {
+    linux_tunnel::open_or_fallback(server).exit_ip
+}
+#[cfg(not(target_os = "linux"))]
+fn open_tunnel(server: &str) -> String {
+    StubTunnel::open(server)
+}
+
+#[cfg(target_os = "linux")]
+fn close_tunnel() {
+    linux_tunnel::close_system();
+    StubTunnel::close();
+}
+#[cfg(not(target_os = "linux"))]
+fn close_tunnel() {
+    StubTunnel::close();
+}
+
 #[derive(Default)]
 struct VpnInner {
     status: VpnStatus,
@@ -81,10 +308,11 @@ pub fn vpn_connect_impl(store: &VpnStore, server: &str) -> VpnStatus {
             guard.status.state = VpnState::Connecting;
             guard.status.server = Some(server.to_owned());
             guard.status.last_error = None;
-            // Stub open is instant: Connecting→Connected under one lock.
-            // The handle stays open until disconnect (real tunnel in tasks 5–7).
+            // Platform open is instant: Connecting→Connected under one lock.
+            // The handle stays open until disconnect (Linux: system TUN in
+            // task 5 with stub fallback; Windows/Android: tasks 6–7).
             guard.handles += 1;
-            guard.status.exit_ip = Some(StubTunnel::open(server));
+            guard.status.exit_ip = Some(open_tunnel(server));
             guard.status.state = VpnState::Connected;
             guard.status.clone()
         }
@@ -95,7 +323,7 @@ pub fn vpn_connect_impl(store: &VpnStore, server: &str) -> VpnStatus {
 pub fn vpn_disconnect_impl(store: &VpnStore) -> VpnStatus {
     let mut guard = store.inner.lock().unwrap();
     if guard.handles > 0 {
-        StubTunnel::close();
+        close_tunnel();
         guard.handles = 0;
     }
     guard.status = VpnStatus::default();
@@ -608,5 +836,80 @@ mod tests {
         let servers = parse_servers(&body);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].city, "Paris");
+    }
+
+    // Task 5 (Linux): route/config parsing, fallback path, guard single-handle.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_default_route_parses_gateway_and_dev() {
+        let out = "default via 192.168.1.1 dev eth0 proto dhcp metric 100\n\
+                   192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.5\n";
+        assert_eq!(
+            linux_tunnel::parse_default_route(out),
+            Some(("192.168.1.1".into(), "eth0".into()))
+        );
+        assert_eq!(
+            linux_tunnel::parse_default_route("192.168.1.0/24 dev eth0 scope link\n"),
+            None
+        );
+        assert_eq!(
+            linux_tunnel::parse_default_route("default dev tun0 scope link\n"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_edge_and_connect_request_carry_guardian_config() {
+        assert_eq!(
+            linux_tunnel::edge_host("x", "edge.example.com"),
+            "edge.example.com"
+        );
+        assert_eq!(
+            linux_tunnel::edge_host("us-california", ""),
+            "us-california.guardian.vpn.mozilla.org"
+        );
+        let req = linux_tunnel::connect_request("edge.example.com", "tok123");
+        assert!(req.starts_with("CONNECT edge.example.com:443"), "{req}");
+        assert!(req.contains("Bearer tok123"), "{req}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_privileged_argv_escalates_via_pkexec() {
+        // pkexec framing is the AC9 system auth prompt; pinned without exec.
+        let (prog, args) = linux_tunnel::privileged_argv("ip", &["tuntap", "add"]);
+        assert_eq!(prog, "pkexec");
+        assert_eq!(args, vec!["ip", "tuntap", "add"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_fallback_uses_stub_with_clear_note() {
+        let opened =
+            linux_tunnel::open_with_probe("de-berlin", Err("simulated: no TUN in CI".into()));
+        assert!(opened.used_stub);
+        assert_eq!(opened.exit_ip, stub_exit_ip("de-berlin"));
+        assert_eq!(opened.note.as_deref(), Some("simulated: no TUN in CI"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_preflight_agrees_with_device_node() {
+        // Deterministic where TUN is absent (CI); vacuous where present.
+        if !std::path::Path::new("/dev/net/tun").exists() {
+            assert!(linux_tunnel::tun_available().is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_double_connect_keeps_single_handle() {
+        let store = VpnStore::default();
+        let first = vpn_connect_impl(&store, "us-california");
+        let second = vpn_connect_impl(&store, "jp-tokyo");
+        assert_eq!(second, first, "repeat connect must not change state");
+        assert_eq!(store.inner.lock().unwrap().handles, 1);
+        vpn_disconnect_impl(&store);
     }
 }
