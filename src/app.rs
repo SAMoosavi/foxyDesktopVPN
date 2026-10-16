@@ -17,6 +17,9 @@ extern "C" {
 #[derive(Serialize, Deserialize, Clone)]
 struct AuthChanged {
     signed_in: bool,
+    // Task 8 (AC7): present when a 401 expires the session — the re-sign-in prompt.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -95,6 +98,8 @@ pub fn App() -> impl IntoView {
                 set_signed_in.set(ev.payload.signed_in);
                 set_status.set(if ev.payload.signed_in {
                     String::from("Signed in — welcome home.")
+                } else if let Some(err) = ev.payload.error {
+                    err
                 } else {
                     String::from("Signed out.")
                 });
@@ -163,6 +168,8 @@ pub fn App() -> impl IntoView {
                         set_vpn_error.set(err);
                     }
                     Err(_) => {
+                        // Task 8: never a stuck "Connecting…" — fall back to Disconnected + error line.
+                        set_vpn_line.set(String::from("Disconnected"));
                         set_vpn_error.set(Some(String::from("VPN call failed — please retry.")))
                     }
                 }

@@ -617,13 +617,122 @@ pub fn vpn_disconnect_impl(store: &VpnStore) -> VpnStatus {
     guard.status.clone()
 }
 
+// Task 8: error/offline/expired-token handling (AC7: expired token →
+// re-sign-in prompt, never a stuck spinner; AC8: offline connect → offline
+// error, stays disconnected). Reuses VpnStatus.last_error + AuthState; no new
+// screens. Tests pass explicit bools so they stay offline-deterministic; only
+// the Tauri command wrappers below touch the real network.
+pub const OFFLINE_ERROR: &str = "Offline — check your connection and try again.";
+pub const EXPIRED_TOKEN_ERROR: &str = "Session expired — please sign in again.";
+pub const SIGNED_OUT_ERROR: &str = "Signed out — please sign in again.";
+pub const GUARDIAN_HOST: &str = "vpn.mozilla.org"; // must match GUARDIAN_SERVERS_URL
+
+/// Offline probe (std only): can we open TCP to the Guardian front door? DNS
+/// failure or refused/timeout ⇒ offline. ~2s worst case, keeping buttons
+/// reactive (AC12). Airplane-mode behavior is a manual check (see runbook).
+pub fn default_online() -> bool {
+    use std::net::ToSocketAddrs;
+    format!("{GUARDIAN_HOST}:443")
+        .to_socket_addrs()
+        .map(|mut addrs| {
+            addrs.any(|addr| {
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// True when a Guardian failure string is an auth rejection (expired/invalid
+/// token) rather than a network blip or an empty list. Matches the status
+/// code reqwest embeds via `error_for_status`, not body text.
+pub fn is_unauthorized(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("401") || lower.contains("unauthorized")
+}
+
+/// Connect with explicit preflight: offline or signed-out stays Disconnected
+/// with an error line (never Connecting); repeat connect on an active
+/// connection stays a no-op (AC6), even offline.
+pub fn vpn_connect_with(
+    store: &VpnStore,
+    auth: Option<&AuthState>,
+    server: &str,
+    online: bool,
+) -> VpnStatus {
+    if vpn_status_impl(store).state != VpnState::Disconnected {
+        return vpn_connect_impl(store, server);
+    }
+    if !online {
+        let mut guard = store.inner.lock().unwrap();
+        guard.status.last_error = Some(OFFLINE_ERROR.into());
+        return guard.status.clone();
+    }
+    if auth.is_some_and(|a| !signed_in(a)) {
+        let mut guard = store.inner.lock().unwrap();
+        guard.status.last_error = Some(SIGNED_OUT_ERROR.into());
+        return guard.status.clone();
+    }
+    vpn_connect_impl(store, server)
+}
+
+/// Guardian 401 (AC7): drop the dead token, tear down any half-open tunnel,
+/// and land Disconnected with a re-sign-in prompt — never a stuck Connecting.
+pub fn handle_guardian_unauthorized(store: &VpnStore, auth: &AuthState) -> VpnStatus {
+    clear_token(auth);
+    let mut guard = store.inner.lock().unwrap();
+    if guard.handles > 0 {
+        close_tunnel();
+        guard.handles = 0;
+    }
+    guard.status = VpnStatus {
+        state: VpnState::Disconnected,
+        server: None,
+        exit_ip: None,
+        last_error: Some(EXPIRED_TOKEN_ERROR.into()),
+    };
+    guard.status.clone()
+}
+
 pub fn vpn_status_impl(store: &VpnStore) -> VpnStatus {
     store.inner.lock().unwrap().status.clone()
 }
 
 #[tauri::command]
-fn vpn_connect(store: State<VpnStore>, server: String) -> VpnStatus {
-    vpn_connect_impl(&store, &server)
+fn vpn_connect(
+    app: AppHandle,
+    store: State<VpnStore>,
+    auth: State<AuthState>,
+    server: String,
+) -> VpnStatus {
+    // Repeat press on a live connection is a no-op (AC6) — no revalidation.
+    if vpn_status_impl(&store).state != VpnState::Disconnected {
+        return vpn_connect_impl(&store, &server);
+    }
+    // Offline or signed-out never opens a tunnel (AC8); the error line says so.
+    if !default_online() {
+        return vpn_connect_with(&store, Some(&auth), &server, false);
+    }
+    let token = auth.token.lock().unwrap().clone();
+    match token {
+        None => vpn_connect_with(&store, Some(&auth), &server, true),
+        // Reuse the servers fetch as the token check: a 401 here means the
+        // stored token is dead → signed-out + re-sign-in prompt (AC7). Any
+        // other Guardian blip still connects; the list view already shows it.
+        Some(token) => match fetch_live_servers(&token) {
+            Err(e) if is_unauthorized(&e) => {
+                let status = handle_guardian_unauthorized(&store, &auth);
+                let _ = app.emit(
+                    AUTH_CHANGED_EVENT,
+                    AuthChanged {
+                        signed_in: false,
+                        error: status.last_error.clone(),
+                    },
+                );
+                status
+            }
+            _ => vpn_connect_with(&store, Some(&auth), &server, true),
+        },
+    }
 }
 
 #[tauri::command]
@@ -788,6 +897,10 @@ pub fn begin_browser_sign_in(
 #[derive(serde::Serialize, Clone)]
 struct AuthChanged {
     signed_in: bool,
+    // Task 8 (AC7): present when a 401 expires the session, so the UI can
+    // show the re-sign-in prompt instead of a bare "Signed out."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[tauri::command]
@@ -802,7 +915,13 @@ fn auth_sign_in(app: AppHandle) -> Result<String, String> {
             // FxA returns an OAuth code; full code→token exchange lands with Guardian wiring.
             let auth: State<AuthState> = callback_app.state();
             store_token(&auth, &code);
-            let _ = callback_app.emit(AUTH_CHANGED_EVENT, AuthChanged { signed_in: true });
+            let _ = callback_app.emit(
+                AUTH_CHANGED_EVENT,
+                AuthChanged {
+                    signed_in: true,
+                    error: None,
+                },
+            );
         },
         CALLBACK_TIMEOUT,
     )
@@ -813,8 +932,14 @@ fn auth_sign_in(app: AppHandle) -> Result<String, String> {
 fn auth_sign_out(app: AppHandle) -> Result<(), String> {
     let auth: State<AuthState> = app.state();
     clear_token(&auth);
-    app.emit(AUTH_CHANGED_EVENT, AuthChanged { signed_in: false })
-        .map_err(|e| e.to_string())
+    app.emit(
+        AUTH_CHANGED_EVENT,
+        AuthChanged {
+            signed_in: false,
+            error: None,
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 // Task 3: server list fetch + picker UI (AC2: city/country list; AC12: no spinner, error line).
@@ -921,7 +1046,7 @@ pub fn resolve_servers_with(
     match token {
         None => ServerList {
             servers: vec![],
-            error: Some("Signed out — please sign in again.".into()),
+            error: Some(SIGNED_OUT_ERROR.into()),
         },
         Some(token) => match fetch(&token) {
             Ok(servers) if !servers.is_empty() => ServerList {
@@ -943,9 +1068,27 @@ pub fn resolve_servers_with(
 }
 
 #[tauri::command]
-fn list_servers(auth: State<AuthState>) -> ServerList {
+fn list_servers(app: AppHandle, auth: State<AuthState>) -> ServerList {
     let token = auth.token.lock().unwrap().clone();
-    resolve_servers_with(token, fetch_live_servers)
+    let list = resolve_servers_with(token, fetch_live_servers);
+    // A 401 inside the fetch error means the stored token is dead: drop it
+    // and flip the UI to the re-sign-in prompt (AC7), not a fixture+spinner.
+    if list.error.as_deref().is_some_and(is_unauthorized) {
+        clear_token(&auth);
+        let error = Some(EXPIRED_TOKEN_ERROR.to_owned());
+        let _ = app.emit(
+            AUTH_CHANGED_EVENT,
+            AuthChanged {
+                signed_in: false,
+                error: error.clone(),
+            },
+        );
+        return ServerList {
+            servers: vec![],
+            error,
+        };
+    }
+    list
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1019,6 +1162,100 @@ mod tests {
         assert_eq!(status.state, VpnState::Disconnected);
         assert!(status.last_error.is_some());
         assert_eq!(store.inner.lock().unwrap().handles, 0);
+    }
+
+    // Task 8 (AC8): offline connect → offline error, stays Disconnected, no stuck Connecting.
+    #[test]
+    fn offline_connect_stays_disconnected_with_offline_error() {
+        let store = VpnStore::default();
+        let auth = AuthState::default();
+        store_token(&auth, "tok123");
+        let status = vpn_connect_with(&store, Some(&auth), "de-berlin", false);
+        assert_eq!(status.state, VpnState::Disconnected);
+        assert_ne!(status.state, VpnState::Connecting);
+        assert!(status.exit_ip.is_none());
+        assert_eq!(store.inner.lock().unwrap().handles, 0);
+        assert!(
+            status
+                .last_error
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("offline"),
+            "offline failure must name itself on the error line"
+        );
+        // Token untouched — offline is not an auth failure.
+        assert!(signed_in(&auth));
+    }
+
+    #[test]
+    fn offline_repeat_connect_keeps_active_connection() {
+        let store = VpnStore::default();
+        let live = vpn_connect_impl(&store, "us-california");
+        assert_eq!(live.state, VpnState::Connected);
+        let repeat = vpn_connect_with(&store, None, "jp-tokyo", false);
+        assert_eq!(repeat, live, "repeat connect must not clobber state");
+    }
+
+    #[test]
+    fn signed_out_connect_prompts_resignin() {
+        let store = VpnStore::default();
+        let auth = AuthState::default();
+        assert!(!signed_in(&auth));
+        let status = vpn_connect_with(&store, Some(&auth), "de-berlin", true);
+        assert_eq!(status.state, VpnState::Disconnected);
+        assert_eq!(store.inner.lock().unwrap().handles, 0);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sign in"),
+            "must prompt re-sign-in, got: {:?}",
+            status.last_error.as_deref()
+        );
+    }
+
+    // Task 8 (AC7): Guardian 401 → token cleared, Disconnected + re-sign-in, tunnel torn down.
+    #[test]
+    fn guardian_401_clears_token_and_prompts_resignin() {
+        let store = VpnStore::default();
+        let auth = AuthState::default();
+        store_token(&auth, "expired-tok");
+        let up = vpn_connect_with(&store, Some(&auth), "de-berlin", true);
+        assert_eq!(up.state, VpnState::Connected);
+        let status = handle_guardian_unauthorized(&store, &auth);
+        assert!(!signed_in(&auth), "dead token must be cleared");
+        assert_eq!(status.state, VpnState::Disconnected);
+        assert_ne!(status.state, VpnState::Connecting);
+        assert!(status.server.is_none() && status.exit_ip.is_none());
+        assert_eq!(store.inner.lock().unwrap().handles, 0);
+        assert_eq!(status.last_error.as_deref(), Some(EXPIRED_TOKEN_ERROR));
+    }
+
+    #[test]
+    fn unauthorized_detection_spots_401_not_generic_failures() {
+        assert!(is_unauthorized(
+            "Could not reach Guardian (401 Unauthorized for url https://vpn.mozilla.org/) — showing sample servers."
+        ));
+        assert!(is_unauthorized("HTTP 401 fetching servers"));
+        assert!(!is_unauthorized(
+            "Could not reach Guardian (dns error: failed to lookup address) — showing sample servers."
+        ));
+        assert!(!is_unauthorized(OFFLINE_ERROR));
+        assert!(!is_unauthorized(SIGNED_OUT_ERROR));
+        assert!(!is_unauthorized(
+            "Server list is empty — showing sample servers."
+        ));
+    }
+
+    #[test]
+    fn guardian_401_in_server_fetch_preserves_signout_signal() {
+        // Pins the command-glue contract: the resolve error text still carries
+        // the 401 so `list_servers` can flip to signed-out (tested pure here).
+        let list = resolve_servers_with(Some("expired-tok".into()), |_| {
+            Err("401 Unauthorized for url https://vpn.mozilla.org/api/".into())
+        });
+        assert!(list.error.as_deref().is_some_and(is_unauthorized));
     }
 
     #[test]
