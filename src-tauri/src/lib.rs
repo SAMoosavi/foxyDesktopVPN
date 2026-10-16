@@ -368,8 +368,172 @@ pub mod windows_tunnel {
     pub fn close_system() {}
 }
 
-/// Platform tunnel open: Linux/Windows try their system path with stub
-/// fallback; other OSes use the stub until task 7.
+// Task 7: Android system tunnel (AC4/AC9 Android: fully-system routing via
+// VpnService consent + fd handoff to the shared Rust core). ponytail: std only
+// — no new TUN/H2 dep (architect approval required per tasks.md gate, not
+// requested from this worktree). The module is unconditional std-only so its
+// config/framing/fd-plumbing parsing + fallback path unit-test on Linux;
+// anything touching the Android runtime (VpnService, JNI) stays behind
+// #[cfg(target_os = "android")] inside `vpnsvc_available`. Live path: VpnService
+// consent → Builder.establish() fd → set_tun_fd(fd) → shared CONNECT framing +
+// packet loop as on Linux. Until the TUN/H2 dep lands, ANY open falls back to
+// StubTunnel with a clear note, so `cargo test` stays green everywhere
+// (hardware IP-check and the VpnService consent dialog are manual).
+//
+// MOBILE GLUE FOLLOW-UP (`tauri android init` outputs not committed — heavy,
+// so the Rust side lands first):
+// 1. Run `cargo tauri android init` → commits `src-tauri/gen/android` + `gen/android`
+//    (AndroidManifest.xml with BIND_VPN_SERVICE permission + SERVICE_INTERFACE
+//    intent-filter, FoxyVpnService.kt extending android.net.VpnService).
+// 2. FoxyVpnService.onStartCommand: VpnService.prepare(ctx) consent intent when
+//    needed → Builder().setSession("FoxyVPN").addAddress(TUN_ADDR, TUN_PREFIX)
+//    .addRoute("0.0.0.0", 0).addDnsServer(DNS).setMtu(MTU).establish() →
+//    detachFd() → android_tunnel::set_tun_fd(fd) here → vpn_connect(server).
+// 3. `run()` below already carries #[cfg_attr(mobile, tauri::mobile_entry_point)]
+//    — no change needed there.
+// Manual verify: VpnService consent dialog → IP-check shows exit IP (AC4/AC9).
+pub mod android_tunnel {
+    use super::{StubTunnel, Tunnel, stub_exit_ip};
+    use std::sync::{Mutex, OnceLock};
+
+    /// VpnService service-interface action (AC9: the consent dialog path).
+    pub const SERVICE_INTERFACE: &str = "android.net.VpnService";
+    pub const TUN_ADDR: &str = "10.42.0.2";
+    pub const TUN_PREFIX: u8 = 30;
+    pub const MTU: u16 = 1500;
+    /// System DNS is used as-is (AC10: no DNS screen).
+    pub const DNS: &str = "10.42.0.1";
+
+    /// Edge host for a server: prefer the Guardian hostname, else derive it.
+    pub fn edge_host(server: &str, hostname: &str) -> String {
+        if hostname.is_empty() {
+            format!("{server}.guardian.vpn.mozilla.org")
+        } else {
+            hostname.to_owned()
+        }
+    }
+
+    /// CONNECT request to the Fastly edge, authorized by the Guardian token
+    /// (same headers as the Linux/Windows paths; sent by the live data plane
+    /// once the approved TUN/H2 dep lands).
+    pub fn connect_request(host: &str, token: &str) -> String {
+        format!(
+            "CONNECT {host}:443 HTTP/1.1\r\n\
+             Host: {host}:443\r\n\
+             Authorization: Bearer {token}\r\n\
+             Proxy-Authorization: Bearer {token}\r\n\r\n"
+        )
+    }
+
+    /// Parse the tun fd the Kotlin side hands over (Builder.establish() →
+    /// ParcelFileDescriptor.detachFd(), passed as a decimal string). Rejects
+    /// negatives/non-numbers so a bad handoff never becomes a live fd.
+    pub fn parse_tun_fd(raw: &str) -> Option<i32> {
+        raw.trim().parse::<i32>().ok().filter(|fd| *fd >= 0)
+    }
+
+    /// Builder config the Kotlin FoxyVpnService applies before establish():
+    /// one address, the default route (fully-system, AC9), MTU, system DNS.
+    pub struct BuilderConfig {
+        pub address: String,
+        pub prefix: u8,
+        pub mtu: u16,
+        pub dns: String,
+        pub routes: Vec<String>,
+    }
+
+    pub fn builder_config() -> BuilderConfig {
+        BuilderConfig {
+            address: TUN_ADDR.into(),
+            prefix: TUN_PREFIX,
+            mtu: MTU,
+            dns: DNS.into(),
+            routes: vec!["0.0.0.0/0".into()],
+        }
+    }
+
+    /// Slot for the fd handed over from Kotlin; consumed once per connect.
+    fn tun_fd_slot() -> &'static Mutex<Option<i32>> {
+        static SLOT: OnceLock<Mutex<Option<i32>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Stash the establish() fd (called via the mobile glue, see above).
+    /// Returns false for a bad fd so Kotlin can re-establish instead.
+    pub fn set_tun_fd(fd: i32) -> bool {
+        if fd < 0 {
+            return false;
+        }
+        *tun_fd_slot().lock().unwrap() = Some(fd);
+        true
+    }
+
+    pub fn take_tun_fd() -> Option<i32> {
+        tun_fd_slot().lock().unwrap().take()
+    }
+
+    /// VpnService preflight with no side effects and no prompt: off-Android it
+    /// is always unavailable; on Android the fd handoff needs the approved
+    /// TUN/H2 dep, so it reports that until the dep lands (no silent fake).
+    pub fn vpnsvc_available() -> Result<(), String> {
+        #[cfg(target_os = "android")]
+        return Err(
+            "VpnService bring-up needs the approved TUN/H2 dep — using stub tunnel.".into(),
+        );
+        #[cfg(not(target_os = "android"))]
+        return Err("VpnService is Android-only — using stub tunnel.".into());
+    }
+
+    pub struct TunnelOpen {
+        pub exit_ip: String,
+        pub used_stub: bool,
+        pub note: Option<String>,
+    }
+
+    /// Smallest-viable Android open: preflight → stashed fd → Rust core.
+    /// ANY failure → StubTunnel with a clear note (green tests, no hangs).
+    pub fn open_or_fallback(server: &str) -> TunnelOpen {
+        match vpnsvc_available() {
+            Err(note) => open_with_probe(server, None, Err(note)),
+            Ok(()) => open_with_probe(server, take_tun_fd(), Ok(())),
+        }
+    }
+
+    /// Injectable fd + preflight so tests pin each path deterministically.
+    pub fn open_with_probe(
+        server: &str,
+        fd: Option<i32>,
+        preflight: Result<(), String>,
+    ) -> TunnelOpen {
+        let fallback = |note: String| TunnelOpen {
+            exit_ip: StubTunnel::open(server),
+            used_stub: true,
+            note: Some(note),
+        };
+        if let Err(note) = preflight {
+            return fallback(note);
+        }
+        if fd.is_none() {
+            return fallback(
+                "no VpnService fd yet — complete the consent step first — using stub tunnel."
+                    .into(),
+            );
+        }
+        let _edge = edge_host(server, "");
+        fallback(
+            "fd handoff needs the approved TUN/H2 dep + one VpnService consent click — using stub tunnel."
+                .into(),
+        )
+    }
+
+    /// Tear down the VpnService session; Android restores the previous default
+    /// route automatically (AC5: IP-check shows the direct IP again). No-op
+    /// until the TUN/H2 dep lands, so disconnect never hangs on fallback.
+    pub fn close_system() {}
+}
+
+/// Platform tunnel open: each OS tries its system path with stub fallback;
+/// other OSes use the stub.
 #[cfg(target_os = "linux")]
 fn open_tunnel(server: &str) -> String {
     linux_tunnel::open_or_fallback(server).exit_ip
@@ -378,7 +542,11 @@ fn open_tunnel(server: &str) -> String {
 fn open_tunnel(server: &str) -> String {
     windows_tunnel::open_or_fallback(server).exit_ip
 }
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "android")]
+fn open_tunnel(server: &str) -> String {
+    android_tunnel::open_or_fallback(server).exit_ip
+}
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 fn open_tunnel(server: &str) -> String {
     StubTunnel::open(server)
 }
@@ -393,7 +561,12 @@ fn close_tunnel() {
     windows_tunnel::close_system();
     StubTunnel::close();
 }
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "android")]
+fn close_tunnel() {
+    android_tunnel::close_system();
+    StubTunnel::close();
+}
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 fn close_tunnel() {
     StubTunnel::close();
 }
@@ -1087,5 +1260,88 @@ mod tests {
     #[test]
     fn windows_preflight_reports_windows_only_off_windows() {
         assert!(windows_tunnel::wintun_available().is_err());
+    }
+
+    // Task 7 (Android): fd-plumbing/framing parsing + fallback path; plain
+    // #[test] (no cfg gate) so they run on this Linux host, and the module is
+    // std-only so it compiles here. Guard tests above stay untouched.
+    #[test]
+    fn android_edge_and_connect_request_carry_guardian_config() {
+        assert_eq!(
+            android_tunnel::edge_host("x", "edge.example.com"),
+            "edge.example.com"
+        );
+        assert_eq!(
+            android_tunnel::edge_host("us-california", ""),
+            "us-california.guardian.vpn.mozilla.org"
+        );
+        let req = android_tunnel::connect_request("edge.example.com", "tok123");
+        assert!(req.starts_with("CONNECT edge.example.com:443"), "{req}");
+        assert!(req.contains("Bearer tok123"), "{req}");
+    }
+
+    #[test]
+    fn android_tun_fd_parsing_rejects_bad_handoff() {
+        assert_eq!(android_tunnel::parse_tun_fd("42"), Some(42));
+        assert_eq!(android_tunnel::parse_tun_fd("  7  "), Some(7));
+        assert_eq!(android_tunnel::parse_tun_fd("-1"), None);
+        assert_eq!(android_tunnel::parse_tun_fd("abc"), None);
+        assert_eq!(android_tunnel::parse_tun_fd(""), None);
+        assert_eq!(android_tunnel::set_tun_fd(-1), false);
+    }
+
+    #[test]
+    fn android_builder_config_pins_system_route_and_dns() {
+        // Fully-system default route + system DNS, no split-tunnel/DNS UI (AC10).
+        let cfg = android_tunnel::builder_config();
+        assert_eq!(cfg.address, android_tunnel::TUN_ADDR);
+        assert_eq!(cfg.prefix, android_tunnel::TUN_PREFIX);
+        assert_eq!(cfg.mtu, android_tunnel::MTU);
+        assert_eq!(cfg.dns, android_tunnel::DNS);
+        assert_eq!(cfg.routes, vec!["0.0.0.0/0"]);
+    }
+
+    #[test]
+    fn android_service_constants_pin_consent_label() {
+        // SERVICE_INTERFACE is the intent-filter action in the follow-up
+        // AndroidManifest.xml (AC9 consent path).
+        assert_eq!(android_tunnel::SERVICE_INTERFACE, "android.net.VpnService");
+        assert!(!android_tunnel::TUN_ADDR.is_empty());
+    }
+
+    #[test]
+    fn android_fd_slot_hands_off_once() {
+        assert!(android_tunnel::set_tun_fd(42));
+        assert_eq!(android_tunnel::take_tun_fd(), Some(42));
+        assert_eq!(android_tunnel::take_tun_fd(), None);
+    }
+
+    #[test]
+    fn android_fallback_uses_stub_with_clear_note() {
+        let opened = android_tunnel::open_with_probe(
+            "de-berlin",
+            None,
+            Err("simulated: no VpnService in CI".into()),
+        );
+        assert!(opened.used_stub);
+        assert_eq!(opened.exit_ip, stub_exit_ip("de-berlin"));
+        assert_eq!(
+            opened.note.as_deref(),
+            Some("simulated: no VpnService in CI")
+        );
+        // Consent done (fd present) but live core missing → stub with fd note.
+        let no_core = android_tunnel::open_with_probe("de-berlin", Some(42), Ok(()));
+        assert!(no_core.used_stub);
+        assert!(no_core.note.unwrap_or_default().contains("TUN/H2"));
+        // Preflight passed but no fd yet → stub with consent note.
+        let no_fd = android_tunnel::open_with_probe("de-berlin", None, Ok(()));
+        assert!(no_fd.used_stub);
+        assert!(no_fd.note.unwrap_or_default().contains("consent"));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn android_preflight_reports_android_only_off_android() {
+        assert!(android_tunnel::vpnsvc_available().is_err());
     }
 }
