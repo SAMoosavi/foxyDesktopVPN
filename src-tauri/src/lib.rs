@@ -13,18 +13,112 @@ use tauri_plugin_opener::OpenerExt;
 
 // Placeholder state harness for the VPN state machine (tasks 4+).
 // ponytail: minimal enum+struct only; transitions/guards land in task 4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum VpnState {
     #[default]
     Disconnected,
+    Connecting,
+    Connected,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VpnStatus {
     pub state: VpnState,
     pub server: Option<String>,
     pub exit_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+// Task 4: stub tunnel backend (AC3/5 status half, AC6). The trait is the seam the
+// per-OS bring-up (tasks 5–7) implements; the stub opens one fake handle and
+// returns a fixture exit IP so connect/disconnect + UI land first.
+pub trait Tunnel {
+    fn open(server: &str) -> String;
+    fn close();
+}
+
+pub struct StubTunnel;
+
+impl Tunnel for StubTunnel {
+    fn open(server: &str) -> String {
+        stub_exit_ip(server)
+    }
+    fn close() {}
+}
+
+/// Fixture exit IP per server id (TEST-NET-3, never routed); unknown ids share the default.
+pub fn stub_exit_ip(server: &str) -> String {
+    match server {
+        "us-california" => "203.0.113.7".into(),
+        "de-berlin" => "203.0.113.23".into(),
+        "jp-tokyo" => "203.0.113.42".into(),
+        _ => "203.0.113.7".into(),
+    }
+}
+
+#[derive(Default)]
+struct VpnInner {
+    status: VpnStatus,
+    handles: u32, // open stub-tunnel handles; guard keeps this ≤1 (AC6)
+}
+
+#[derive(Default)]
+pub struct VpnStore {
+    inner: Mutex<VpnInner>,
+}
+
+/// One guarded connection: repeat connect while Connecting|Connected is a no-op (AC6).
+pub fn vpn_connect_impl(store: &VpnStore, server: &str) -> VpnStatus {
+    let mut guard = store.inner.lock().unwrap();
+    match guard.status.state {
+        VpnState::Connecting | VpnState::Connected => guard.status.clone(),
+        VpnState::Disconnected => {
+            if server.is_empty() {
+                guard.status.last_error = Some("Pick a server first.".into());
+                return guard.status.clone();
+            }
+            guard.status.state = VpnState::Connecting;
+            guard.status.server = Some(server.to_owned());
+            guard.status.last_error = None;
+            // Stub open is instant: Connecting→Connected under one lock.
+            // The handle stays open until disconnect (real tunnel in tasks 5–7).
+            guard.handles += 1;
+            guard.status.exit_ip = Some(StubTunnel::open(server));
+            guard.status.state = VpnState::Connected;
+            guard.status.clone()
+        }
+    }
+}
+
+/// Tear down the connection; exit IP clears so IP-check shows the direct IP (AC5).
+pub fn vpn_disconnect_impl(store: &VpnStore) -> VpnStatus {
+    let mut guard = store.inner.lock().unwrap();
+    if guard.handles > 0 {
+        StubTunnel::close();
+        guard.handles = 0;
+    }
+    guard.status = VpnStatus::default();
+    guard.status.clone()
+}
+
+pub fn vpn_status_impl(store: &VpnStore) -> VpnStatus {
+    store.inner.lock().unwrap().status.clone()
+}
+
+#[tauri::command]
+fn vpn_connect(store: State<VpnStore>, server: String) -> VpnStatus {
+    vpn_connect_impl(&store, &server)
+}
+
+#[tauri::command]
+fn vpn_disconnect(store: State<VpnStore>) -> VpnStatus {
+    vpn_disconnect_impl(&store)
+}
+
+#[tauri::command]
+fn vpn_status(store: State<VpnStore>) -> VpnStatus {
+    vpn_status_impl(&store)
 }
 
 pub const FXA_AUTHORIZE_BASE: &str = "https://accounts.firefox.com/authorization";
@@ -344,10 +438,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AuthState::default())
+        .manage(VpnStore::default())
         .invoke_handler(tauri::generate_handler![
             auth_sign_in,
             auth_sign_out,
-            list_servers
+            list_servers,
+            vpn_connect,
+            vpn_disconnect,
+            vpn_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -362,6 +460,50 @@ mod tests {
     #[test]
     fn initial_status_is_disconnected() {
         assert_eq!(VpnStatus::default().state, VpnState::Disconnected);
+    }
+
+    #[test]
+    fn connect_transitions_to_connected_with_exit_ip() {
+        let store = VpnStore::default();
+        assert_eq!(vpn_status_impl(&store).state, VpnState::Disconnected);
+        let status = vpn_connect_impl(&store, "de-berlin");
+        assert_eq!(status.state, VpnState::Connected);
+        assert_eq!(status.server.as_deref(), Some("de-berlin"));
+        assert_eq!(status.exit_ip.as_deref(), Some("203.0.113.23"));
+        assert!(status.last_error.is_none());
+        assert_eq!(vpn_status_impl(&store).state, VpnState::Connected);
+    }
+
+    #[test]
+    fn double_connect_is_noop_with_single_handle() {
+        let store = VpnStore::default();
+        let first = vpn_connect_impl(&store, "us-california");
+        let second = vpn_connect_impl(&store, "jp-tokyo");
+        assert_eq!(second, first, "repeat connect must not change state");
+        assert_eq!(second.server.as_deref(), Some("us-california"));
+        assert_eq!(store.inner.lock().unwrap().handles, 1);
+    }
+
+    #[test]
+    fn disconnect_returns_to_disconnected_and_clears_exit_ip() {
+        let store = VpnStore::default();
+        vpn_connect_impl(&store, "us-california");
+        let status = vpn_disconnect_impl(&store);
+        assert_eq!(status.state, VpnState::Disconnected);
+        assert!(status.exit_ip.is_none());
+        assert!(status.server.is_none());
+        assert_eq!(store.inner.lock().unwrap().handles, 0);
+        // Disconnect when already disconnected is a harmless no-op.
+        assert_eq!(vpn_disconnect_impl(&store).state, VpnState::Disconnected);
+    }
+
+    #[test]
+    fn connect_without_server_stays_disconnected_with_error() {
+        let store = VpnStore::default();
+        let status = vpn_connect_impl(&store, "");
+        assert_eq!(status.state, VpnState::Disconnected);
+        assert!(status.last_error.is_some());
+        assert_eq!(store.inner.lock().unwrap().handles, 0);
     }
 
     #[test]
