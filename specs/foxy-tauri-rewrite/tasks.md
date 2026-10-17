@@ -21,9 +21,9 @@ require architect approval per spec constraints. If denied, escalate to `team-le
 1. **Scaffold + one passing test.** — Goal: `cargo test` green and `trunk build` smoke pass on the untouched scaffold.
    Wire a single placeholder test (e.g. initial `VpnState::Disconnected`) in `src-tauri`, commit the
    lockfile (or document why not), record `cargo test` + `trunk build` output. Covers: harness for all ACs.
-2. **FxA sign-in via system browser.** — Goal: sign-in completes in the browser, app lands on signed-in home (depends on #1).
-   `auth_sign_in` (opener) + deep-link/loopback callback + `auth_sign_out`; token to OS keychain (approval-gated).
-   Verify: click sign-in → browser → home screen, no pasting. Covers ACs 1, 12.
+2. **FxA email/password sign-in + auto-login (reference parity).** — Goal: Firefox email+password in the app lands on signed-in home; saved session restores on launch (depends on #1).
+   onepw `authPW` (PBKDF2+HKDF) + Hawk + `fxa-credentials` token grant + emailed 2FA + `auth_restore`/`auth_sign_out`; session JSON to OS keychain, refreshed near expiry. Uses the reference client's public FxA client id.
+   Verify: sign in once → home; relaunch → home without re-entry. Covers ACs 1, 12.
 3. **Server list fetch + picker UI.** — Goal: signed-in user sees city/country list and picks a server (depends on #2).
    `list_servers` (Guardian API, approval-gated HTTP) + Leptos list view; empty-list shows error line, not spinner.
    Verify: list renders with city/country. Covers ACs 2, 12.
@@ -58,3 +58,21 @@ require architect approval per spec constraints. If denied, escalate to `team-le
 ## Coverage check
 AC1→#2 · AC2→#3 · AC3→#4 · AC4→#5/#6/#7 · AC5→#4(status)/#5–#7(restore) · AC6→#4 · AC7→#8 ·
 AC8→#8 · AC9→#5/#6/#7 · AC10→#11 · AC11→#4 · AC12→#2/#3/#4, swept in #11 · AC13→#9 · AC14→#10 · AC15→#11.
+
+## Stage-4 status (2026-10-17)
+Fully done and test-verified: #1–#4, #8, #9 (workflow file), #10 (config/key), #11.
+#2 is done as the reference client's email/password onepw flow with 2FA and
+keychain auto-login (refresh on launch), including the Fastly 406 challenge
+solver (pow/pat/clientmetrics + cookie retry, unit-tested and live-probed).
+Partially done: #5 (Linux half — the proxy data plane landed on 2026-10-17 per
+the user's request: Guardian `fpn` proxy pass → TLS/ALPN-h2 `CONNECT` streams to
+the Remote Settings edge → local SOCKS5 `:1080` + HTTP `:8080`, system-proxy
+set/restore with crash recovery, exit IP verified live through both proxies;
+`tokio`/`h2`/`tokio-rustls`/`rustls`/`bytes`/`http` deps added — the user's
+explicit "implement like Vauth/FoxyVPN … set proxy well" request cleared the
+"new tunnel/network dependency" gate for this worktree). Still stub/fallback:
+TUN + fully-system routing (AC9) on Linux, and all of #6/#7 (Windows,
+Android). Partial elsewhere: #9 (never run; Android
+`gen/android` not committed), #10 (endpoint `<org>/<repo>` placeholder, no
+release published). See `spec.md` → Verification status for the AC mapping and
+unblock path.

@@ -40,7 +40,7 @@
       "endpoints": [
         "https://github.com/<org>/<repo>/releases/latest/download/latest.json"
       ],
-      "pubkey": "TODO(task10): run `cargo tauri signer generate -w ~/.tauri/foxy.key`, paste the public key here, and replace <org>/<repo> above after `gh repo create` (task 11 runbook)"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEEzNDQyRUI3N0RGQjc3QjcKUldTM2QvdDl0eTVFb3g0d0hNRXh6ZVBJT05vMVNPb2hrY1AzMXpJQXh6ZUhMdDZBSW5nekJnc04K"
     }
   }
 }

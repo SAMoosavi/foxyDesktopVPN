@@ -20,6 +20,20 @@ struct AuthChanged {
     // Task 8 (AC7): present when a 401 expires the session — the re-sign-in prompt.
     #[serde(default)]
     error: Option<String>,
+    // FxA emailed confirmation code required (reference-client 2FA flow).
+    #[serde(default)]
+    needs_verification: bool,
+}
+
+#[derive(Serialize)]
+struct Credentials {
+    email: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct CodeArgs {
+    code: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -50,6 +64,9 @@ struct VpnStatus {
     exit_ip: Option<String>,
     #[serde(default)]
     last_error: Option<String>,
+    /// Local proxy endpoints while connected (data plane is running).
+    #[serde(default)]
+    proxy: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -59,7 +76,7 @@ struct ConnectArgs {
 
 fn describe_vpn(status: &VpnStatus) -> (bool, String, Option<String>) {
     let up = status.state == "Connected";
-    let line = if up {
+    let mut line = if up {
         format!(
             "Connected — {} (exit IP {})",
             status.server.clone().unwrap_or_default(),
@@ -70,6 +87,12 @@ fn describe_vpn(status: &VpnStatus) -> (bool, String, Option<String>) {
     } else {
         String::from("Disconnected")
     };
+    // Data plane up: show where the local proxies listen, so apps can be
+    // pointed at them (reference client's "Proxy active • SOCKS/HTTP" line).
+    if let Some(proxy) = status.proxy.clone() {
+        line.push_str(" — proxy ");
+        line.push_str(&proxy);
+    }
     (up, line, status.last_error.clone())
 }
 
@@ -82,6 +105,12 @@ struct TauriEvent {
 pub fn App() -> impl IntoView {
     let (signed_in, set_signed_in) = signal(false);
     let (status, set_status) = signal(String::from("Signed out."));
+    // FxA email/password sign-in, with the emailed 2FA step (reference flow).
+    let (email, set_email) = signal(String::new());
+    let (password, set_password) = signal(String::new());
+    let (code, set_code) = signal(String::new());
+    let (needs_verification, set_needs_verification) = signal(false);
+    let (auth_error, set_auth_error) = signal(Option::<String>::None);
     // Task 3: server list (AC2) + picked server; errors render as a line, never a spinner.
     let (servers, set_servers) = signal(Vec::<Server>::new());
     let (servers_error, set_servers_error) = signal(Option::<String>::None);
@@ -112,16 +141,90 @@ pub fn App() -> impl IntoView {
         });
     });
 
-    let sign_in = move |_| {
-        // Immediate feedback (AC12); the signed-in home arrives via `auth-changed`.
-        set_status.set(String::from("Opening system browser…"));
+    // Auto-login: restore the keychain session on launch, so a returning user
+    // lands on the signed-in home without a browser or re-entering anything.
+    Effect::new(move || {
         spawn_local(async move {
-            let msg = invoke("auth_sign_in", JsValue::UNDEFINED)
-                .await
-                .as_string()
-                .unwrap_or_default();
-            if !msg.is_empty() {
-                set_status.set(msg);
+            let value = invoke("auth_restore", JsValue::UNDEFINED).await;
+            if let Ok(changed) = serde_wasm_bindgen::from_value::<AuthChanged>(value)
+                && changed.signed_in
+            {
+                set_signed_in.set(true);
+                set_status.set(String::from("Signed in — welcome back."));
+            }
+        });
+    });
+
+    let sign_in = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let email = email.get_untracked();
+        let password = password.get_untracked();
+        // Immediate feedback (AC12); failures land on the error line.
+        set_auth_error.set(None);
+        if email.trim().is_empty() || password.is_empty() {
+            set_auth_error.set(Some(String::from(
+                "Enter your Firefox account email and password.",
+            )));
+            return;
+        }
+        set_status.set(String::from("Signing in…"));
+        spawn_local(async move {
+            let args = serde_wasm_bindgen::to_value(&Credentials { email, password })
+                .unwrap_or(JsValue::UNDEFINED);
+            let value = invoke("auth_sign_in", args).await;
+            match serde_wasm_bindgen::from_value::<AuthChanged>(value) {
+                Ok(changed) => {
+                    set_password.set(String::new());
+                    set_signed_in.set(changed.signed_in);
+                    set_needs_verification.set(changed.needs_verification);
+                    if changed.signed_in {
+                        set_status.set(String::from("Signed in — welcome back."));
+                    } else {
+                        set_status.set(String::from("Signed out."));
+                        set_auth_error.set(changed.error);
+                    }
+                }
+                Err(_) => {
+                    set_status.set(String::from("Signed out."));
+                    set_auth_error.set(Some(String::from("Sign-in call failed — please retry.")))
+                }
+            }
+        });
+    };
+
+    let verify = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let code = code.get_untracked();
+        set_auth_error.set(None);
+        if code.trim().is_empty() {
+            set_auth_error.set(Some(String::from(
+                "Enter the confirmation code from your email.",
+            )));
+            return;
+        }
+        set_status.set(String::from("Verifying…"));
+        spawn_local(async move {
+            let args =
+                serde_wasm_bindgen::to_value(&CodeArgs { code }).unwrap_or(JsValue::UNDEFINED);
+            let value = invoke("auth_verify_code", args).await;
+            match serde_wasm_bindgen::from_value::<AuthChanged>(value) {
+                Ok(changed) => {
+                    set_code.set(String::new());
+                    set_signed_in.set(changed.signed_in);
+                    set_needs_verification.set(changed.needs_verification);
+                    if changed.signed_in {
+                        set_status.set(String::from("Signed in — welcome back."));
+                    } else {
+                        set_status.set(String::from("Signed out."));
+                        set_auth_error.set(changed.error);
+                    }
+                }
+                Err(_) => {
+                    set_status.set(String::from("Signed out."));
+                    set_auth_error.set(Some(String::from(
+                        "Verification call failed — please retry.",
+                    )))
+                }
             }
         });
     };
@@ -258,10 +361,58 @@ pub fn App() -> impl IntoView {
                         </div>
                     }
                         .into_any()
+                } else if needs_verification.get() {
+                    view! {
+                        <div>
+                            <h2>"Sign in with Firefox"</h2>
+                            <p>"Enter the confirmation code sent to your email"</p>
+                            <form class="signin" on:submit=verify>
+                                <input
+                                    type="text"
+                                    placeholder="Confirmation code"
+                                    inputmode="numeric"
+                                    autocomplete="one-time-code"
+                                    prop:value=move || code.get()
+                                    on:input=move |ev| set_code.set(event_target_value(&ev))
+                                />
+                                <button type="submit">"Verify"</button>
+                            </form>
+                            {move || {
+                                auth_error
+                                    .get()
+                                    .map(|e| view! { <p class="error">{e}</p> }.into_any())
+                                    .unwrap_or_else(|| ().into_any())
+                            }}
+                        </div>
+                    }
+                        .into_any()
                 } else {
                     view! {
                         <div>
-                            <button on:click=sign_in>"Sign in with Firefox"</button>
+                            <h2>"Sign in with Firefox"</h2>
+                            <form class="signin" on:submit=sign_in>
+                                <input
+                                    type="email"
+                                    placeholder="Firefox account email"
+                                    autocomplete="username"
+                                    prop:value=move || email.get()
+                                    on:input=move |ev| set_email.set(event_target_value(&ev))
+                                />
+                                <input
+                                    type="password"
+                                    placeholder="Password"
+                                    autocomplete="current-password"
+                                    prop:value=move || password.get()
+                                    on:input=move |ev| set_password.set(event_target_value(&ev))
+                                />
+                                <button type="submit">"Continue"</button>
+                            </form>
+                            {move || {
+                                auth_error
+                                    .get()
+                                    .map(|e| view! { <p class="error">{e}</p> }.into_any())
+                                    .unwrap_or_else(|| ().into_any())
+                            }}
                         </div>
                     }
                         .into_any()

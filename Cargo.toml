@@ -15,3 +15,12 @@ console_error_panic_hook = "0.1.7"
 
 [workspace]
 members = ["src-tauri"]
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+# Profiles must live at the workspace root; members' profiles are ignored.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
